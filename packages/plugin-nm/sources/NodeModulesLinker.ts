@@ -23,7 +23,20 @@ const INSTALL_STATE_FILE = `.yarn-state.yml` as Filename;
 const MTIME_ACCURANCY = 1000;
 
 type InstallState = {locatorMap: NodeModulesLocatorMap, locationTree: LocationTree, binSymlinks: BinSymlinkMap, nmMode: NodeModulesMode, mtimeMs: number};
-type BinSymlinkMap = Map<PortablePath, Map<Filename, PortablePath>>;
+
+/**
+ * @example
+ * Map {
+ *  'example-package' -> Map {
+ *    'bin-file' ->
+ *      [
+ *        '/example-package/node_modules/example-dependency/bin/bin-file',
+ *        '/example-package/node_modules/example-dependency/'
+ *      ]
+ *  }
+ * }
+ */
+type BinSymlinkMap = Map<PortablePath, Map<Filename, [PortablePath, PortablePath]>>;
 type LoadManifest = (locator: LocatorKey, installLocation: PortablePath) => Promise<Pick<Manifest, `bin`>>;
 
 export enum NodeModulesMode {
@@ -436,7 +449,7 @@ async function writeInstallState(project: Project, locatorMap: NodeModulesLocato
           throw new Error(`Assertion failed: Expected the path to be within the project (${location})`);
 
         locatorState += `    ${JSON.stringify(internalPath)}:\n`;
-        for (const [name, target] of symlinks) {
+        for (const [name, [target]] of symlinks) {
           const relativePath = ppath.relative(ppath.join(location, NODE_MODULES), target);
           locatorState += `      ${JSON.stringify(name)}: ${JSON.stringify(relativePath)}\n`;
         }
@@ -493,7 +506,7 @@ async function findInstallState(project: Project, {unrollAliases = false}: {unro
         const location = ppath.join(rootPath, npath.toPortablePath(relativeLocation));
         const symlinks = miscUtils.getMapWithDefault(binSymlinks, location);
         for (const [name, target] of Object.entries(locationSymlinks as any)) {
-          symlinks.set(name as Filename, npath.toPortablePath([location, NODE_MODULES, target].join(ppath.sep)));
+          symlinks.set(name as Filename, [npath.toPortablePath([location, NODE_MODULES, target].join(ppath.sep)), location]);
         }
       }
     }
@@ -990,14 +1003,14 @@ async function createBinSymlinkMap(installState: NodeModulesLocatorMap, location
 
   const binSymlinks: BinSymlinkMap = new Map();
 
-  const getBinSymlinks = (location: PortablePath, parentLocatorLocation: PortablePath, node: LocationNode): Map<Filename, PortablePath> => {
+  const getBinSymlinks = (location: PortablePath, parentLocatorLocation: PortablePath, node: LocationNode): Map<Filename, [PortablePath, PortablePath]> => {
     const symlinks = new Map();
     const internalPath = ppath.contains(projectRoot, location);
     if (node.locator && internalPath !== null) {
       const binScripts = locatorScriptMap.get(node.locator)!;
       for (const [filename, scriptPath] of binScripts) {
         const symlinkTarget = ppath.join(location, npath.toPortablePath(scriptPath));
-        symlinks.set(filename, symlinkTarget);
+        symlinks.set(filename, [symlinkTarget, location]);
       }
       for (const [childLocation, childNode] of node.children) {
         const absChildLocation = ppath.join(location, childLocation);
@@ -1009,8 +1022,8 @@ async function createBinSymlinkMap(installState: NodeModulesLocatorMap, location
     } else {
       for (const [childLocation, childNode] of node.children) {
         const childSymlinks = getBinSymlinks(ppath.join(location, childLocation), parentLocatorLocation, childNode);
-        for (const [name, symlinkTarget] of childSymlinks) {
-          symlinks.set(name, symlinkTarget);
+        for (const [name, value] of childSymlinks) {
+          symlinks.set(name, value);
         }
       }
     }
@@ -1315,7 +1328,9 @@ async function persistNodeModules(preinstallState: InstallState, installState: N
     await xfs.mkdirPromise(rootNmDirPath, {recursive: true});
 
     const binSymlinks = await createBinSymlinkMap(installState, locationTree, project.cwd, {loadManifest});
-    await persistBinSymlinks(prevBinSymlinks, binSymlinks, project.cwd, windowsLinkType);
+    const addedDirs = new Set(addList.map(l => l.dstDir));
+
+    await persistBinSymlinks(prevBinSymlinks, binSymlinks, project.cwd, windowsLinkType, addedDirs);
 
     await writeInstallState(project, installState, binSymlinks, nmMode, {installChangedByUser});
 
@@ -1327,7 +1342,7 @@ async function persistNodeModules(preinstallState: InstallState, installState: N
   }
 }
 
-async function persistBinSymlinks(previousBinSymlinks: BinSymlinkMap, binSymlinks: BinSymlinkMap, projectCwd: PortablePath, windowsLinkType: WindowsLinkType) {
+async function persistBinSymlinks(previousBinSymlinks: BinSymlinkMap, binSymlinks: BinSymlinkMap, projectCwd: PortablePath, windowsLinkType: WindowsLinkType, addedDirs: Set<PortablePath>) {
   // Delete outdated .bin folders
   for (const location of previousBinSymlinks.keys()) {
     if (ppath.contains(projectCwd, location) === null)
@@ -1354,11 +1369,11 @@ async function persistBinSymlinks(previousBinSymlinks: BinSymlinkMap, binSymlink
       }
     }
 
-    for (const [name, target] of symlinks) {
+    for (const [name, [target, binPackageLocation]] of symlinks) {
       const prevTarget = prevSymlinks.get(name);
       const symlinkPath = ppath.join(binDir, name);
-      // Skip unchanged .bin symlinks
-      if (prevTarget === target)
+      // Skip unchanged .bin symlinks except for added/changed packages since they need permissions applied
+      if (prevTarget === target && !addedDirs.has(binPackageLocation))
         continue;
 
       if (process.platform === `win32`) {
